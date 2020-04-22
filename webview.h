@@ -75,6 +75,9 @@ WEBVIEW_API void webview_set_title(webview_t w, const char *title);
 WEBVIEW_API void webview_set_size(webview_t w, int width, int height,
                                   int hints);
 
+// Sets the cookie with the given name, value and domain.
+WEBVIEW_API void webview_set_cookie(webview_t w, const char* name, const char* value, const char* domain);
+
 // Navigates webview to the given URL. URL may be a data URI, i.e.
 // "data:text/text,<html>...</html>". It is often ok not to url-encode it
 // properly, webview will re-encode it for you.
@@ -130,6 +133,7 @@ WEBVIEW_API void webview_return(webview_t w, const char *seq, int status,
 #include <future>
 #include <map>
 #include <string>
+#include <sstream>
 #include <utility>
 #include <vector>
 
@@ -744,9 +748,11 @@ using browser_engine = cocoa_wkwebview_engine;
 #include <objbase.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Web.UI.Interop.h>
+#include <winrt/Windows.Web.Http.Headers.h>
 #pragma comment(lib, "windowsapp")
 
 // Edge/Chromium headers and libs
+#include "atlbase.h"
 #include "webview2.h"
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
@@ -760,6 +766,7 @@ class browser {
 public:
   virtual ~browser() = default;
   virtual bool embed(HWND, bool, msg_cb_t) = 0;
+  virtual void set_cookie(const std::string name, const std::string value, const std::string domain) = 0;
   virtual void navigate(const std::string url) = 0;
   virtual void eval(const std::string js) = 0;
   virtual void init(const std::string js) = 0;
@@ -773,6 +780,8 @@ using namespace winrt;
 using namespace Windows::Foundation;
 using namespace Windows::Web::UI;
 using namespace Windows::Web::UI::Interop;
+using namespace Windows::Web::Http;
+using namespace Windows::Web::Http::Headers;
 
 class edge_html : public browser {
 public:
@@ -805,13 +814,23 @@ public:
     return true;
   }
 
+  void set_cookie(const std::string name, const std::string value, const std::string domain) override {
+	  HttpCookiePairHeaderValue cookie(winrt::to_hstring(name), winrt::to_hstring(value));
+	  m_request.Headers().Cookie().Append(cookie);
+  }
+
   void navigate(const std::string url) override {
     std::string html = html_from_uri(url);
     if (html != "") {
       m_webview.NavigateToString(winrt::to_hstring(html));
     } else {
       Uri uri(winrt::to_hstring(url));
-      m_webview.Navigate(uri);
+          
+      HttpMethod method(HttpMethod::Get());
+      m_request.Method(method);
+          
+      m_request.RequestUri(uri);
+      m_webview.NavigateWithHttpRequestMessage(m_request);
     }
   }
 
@@ -836,6 +855,7 @@ public:
 
 private:
   WebViewControl m_webview = nullptr;
+  HttpRequestMessage m_request = nullptr;
   std::string init_js = "";
 };
 
@@ -853,11 +873,22 @@ public:
         new webview2_com_handler(wnd, [&](IWebView2WebView *webview) {
           m_webview = webview;
           flag.clear();
+		  if (!debug) {
+			if (CComPtr<IWebView2Settings> settings; m_webview->get_Settings(&settings) == S_OK) {
+			  settings->put_AreDevToolsEnabled(FALSE);
+              settings->put_IsStatusBarEnabled(FALSE);
+			  
+              if (CComPtr<IWebView2Settings2> settings2; settings->QueryInterface<IWebView2Settings2>(&settings2) == S_OK) {
+                settings2->put_AreDefaultContextMenusEnabled(FALSE);
+              }
+			}
+		  }
         }));
     if (res != S_OK) {
       CoUninitialize();
       return false;
     }
+	
     MSG msg = {};
     while (flag.test_and_set() && GetMessage(&msg, NULL, 0, 0)) {
       TranslateMessage(&msg);
@@ -876,7 +907,14 @@ public:
     m_webview->put_Bounds(bounds);
   }
 
+  void set_cookie(const std::string name, const std::string value, const std::string domain) override {
+      std::stringstream cookie{};
+      cookie << std::string{} << "{ \"name\": \"" << name << "\", \"value\": \"" << value << "\", \"domain\": \"" << domain << "\"}";
+	  m_webview->CallDevToolsProtocolMethod(L"Network.setCookie", to_lpwstr(cookie.str()), nullptr);
+  }
+
   void navigate(const std::string url) override {
+	//HttpRequestMessage req = nullptr;
     auto wurl = to_lpwstr(url);
     m_webview->Navigate(wurl);
     delete[] wurl;
@@ -1053,6 +1091,9 @@ public:
     }
   }
 
+  void set_cookie(const std::string name, const std::string value, const std::string domain) { 
+      m_browser->set_cookie(name, value, domain);  
+  }
   void navigate(const std::string url) { m_browser->navigate(url); }
   void eval(const std::string js) { m_browser->eval(js); }
   void init(const std::string js) { m_browser->init(js); }
@@ -1191,6 +1232,10 @@ WEBVIEW_API void webview_set_title(webview_t w, const char *title) {
 WEBVIEW_API void webview_set_size(webview_t w, int width, int height,
                                   int hints) {
   static_cast<webview::webview *>(w)->set_size(width, height, hints);
+}
+
+WEBVIEW_API void webview_set_cookie(webview_t w, const char* name, const char* value, const char* domain) {
+	static_cast<webview::webview*>(w)->set_cookie(name, value, domain);
 }
 
 WEBVIEW_API void webview_navigate(webview_t w, const char *url) {
